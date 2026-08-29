@@ -297,14 +297,13 @@ def generate_message_key(item: Dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 class OTPManClient:
-    def __init__(self, base_url: str, api_key: str, timeout: float = 20.0):
+    def __init__(self, base_url: str, api_key: str, timeout: float = 15.0):
         self.base_url  = base_url.rstrip("/")
         self.api_key   = api_key.strip()
         self.timeout   = timeout
         self._client: Optional[httpx.AsyncClient] = None
         self.last_request_ts: float = 0.0
-        # Required minimum gap for 5 requests per minute (60s / 5 = 12.0s)
-        self.min_interval: float = max(POLL_INTERVAL_SECONDS, 12.0)
+        self.min_interval: float = float(os.getenv("POLL_INTERVAL_SECONDS", "12.0"))
 
     def _get_http_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -328,12 +327,10 @@ class OTPManClient:
 
         try:
             client = self._get_http_client()
-            # Pass start_date as yesterday UTC so we don't miss window across midnight
             start_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
             url = f"{self.base_url}/api/v1/iprn/messages"
-            # Filter strictly for 'a2p' (Application-to-Person) OTP verification SMS
             msg_type = os.getenv("MESSAGE_TYPE", "a2p").strip().lower()
-            params = {
+            params: Dict[str, Any] = {
                 "per_page": 200,
                 "start_date": start_date,
             }
@@ -352,19 +349,18 @@ class OTPManClient:
                 retry_hdr = res.headers.get("Retry-After")
                 try:
                     data = res.json()
-                    wait_sec = float(retry_hdr or data.get("error", {}).get("retry_after") or 45.0)
+                    wait_sec = float(retry_hdr or data.get("error", {}).get("retry_after") or 12.0)
                 except Exception:
-                    wait_sec = float(retry_hdr or 45.0)
-                logger.warning(f"⚠️ OTPMAN Rate Limited (429). Waiting {wait_sec}s before next request...")
-                await asyncio.sleep(wait_sec)
+                    wait_sec = float(retry_hdr or 12.0)
+                logger.warning(f"⚠️ OTPMAN Rate Limited (429). Waiting {wait_sec:.0f}s cooldown...")
+                await asyncio.sleep(wait_sec + 0.5)
                 return []
 
-            # If remaining quota is exhausted, sleep until reset window
             if remaining_val is not None and str(remaining_val).isdigit() and int(remaining_val) == 0:
                 if reset_ts_val and str(reset_ts_val).isdigit():
                     now_epoch = datetime.now(timezone.utc).timestamp()
-                    sleep_until_reset = max(float(reset_ts_val) - now_epoch + 1.0, self.min_interval)
-                    logger.info(f"⏳ Rate limit quota reached (0 remaining). Resting for {sleep_until_reset:.1f}s...")
+                    sleep_until_reset = max(float(reset_ts_val) - now_epoch + 0.5, 1.0)
+                    logger.info(f"⏳ Rate limit quota waiting {sleep_until_reset:.1f}s for reset window...")
                     await asyncio.sleep(sleep_until_reset)
 
             if res.is_success:
@@ -865,16 +861,16 @@ async def poll_incoming_messages(application: Application):
                         ok = await _deliver_item(application.bot, item, dest_ids)
                         if ok:
                             total_forwarded_count += 1
-                        await asyncio.sleep(0.4)
 
         except (TimedOut, NetworkError) as net_err:
-            logger.warning(f"⚠️ Network hiccup: {net_err}. Retrying in 5s...")
-            await asyncio.sleep(5.0)
+            logger.warning(f"⚠️ Network hiccup: {net_err}. Retrying in 3s...")
+            await asyncio.sleep(3.0)
         except Exception as e:
-            logger.error(f"⚠️ Polling error: {e}. Continuing in 5s...")
-            await asyncio.sleep(5.0)
+            logger.error(f"⚠️ Polling error: {e}. Continuing in 3s...")
+            await asyncio.sleep(3.0)
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        # Micro-yield (0.1s) since fetch_incoming_messages already handles exact rate-limit timing
+        await asyncio.sleep(0.1)
 
 # ==========================================
 # 10. Bot Commands & Announcements
