@@ -110,6 +110,8 @@ jobs:
           SECONDARY_GROUP_CHAT_ID: ${{ secrets.SECONDARY_GROUP_CHAT_ID || secrets.TELEGRAM_SECONDARY_GROUP_CHAT_ID }}
           POLL_INTERVAL_SECONDS: ${{ secrets.POLL_INTERVAL_SECONDS || '12.0' }}
           ADMIN_USER_IDS: ${{ secrets.ADMIN_USER_IDS }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
           STARTUP_TYPE: ${{ github.event_name }}
           DB_FILE: ${{ github.workspace }}/otp_database.db
         run: |
