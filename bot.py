@@ -742,6 +742,14 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str, max_retries: int = 
             logger.warning(f"Network error sending to {chat_id}: {net_err}. Retry {attempt}/{max_retries}...")
             await asyncio.sleep(3.0)
         except Exception as e:
+            err_str = str(e).lower()
+            if "can't parse entities" in err_str or "parse" in err_str:
+                try:
+                    plain = re.sub(r"<[^>]+>", "", text)
+                    await bot.send_message(chat_id=chat_id, text=plain)
+                    return True
+                except Exception:
+                    pass
             logger.error(f"❌ Cannot send to {chat_id}: {e}")
             return False
     return False
