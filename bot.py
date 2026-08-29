@@ -187,9 +187,94 @@ def is_user_authorized(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
 # ==========================================
-# 6. SQLite Database Layer (7-day retention)
 # ==========================================
+# 6. GitHub Gist Cloud Storage (28-Hour Retention)
+# ==========================================
+GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
+GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
 seen_message_ids: Set[str] = set()
+seen_timestamps: Dict[str, float] = {}
+_gist_dirty: bool = False
+
+class GistStorage:
+    def __init__(self, gist_id: str, token: str, filename: str = "otpman_seen_messages.json"):
+        self.gist_id = gist_id
+        self.token = token
+        self.filename = filename
+        self.enabled = bool(gist_id and token)
+        self.api_url = f"https://api.github.com/gists/{gist_id}"
+
+    async def load_seen(self) -> Dict[str, float]:
+        """Fetch 28h history from GitHub Gist."""
+        if not self.enabled:
+            return {}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(
+                    self.api_url,
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    }
+                )
+                if res.is_success:
+                    data = res.json()
+                    files = data.get("files", {})
+                    if self.filename in files:
+                        content_str = files[self.filename].get("content", "{}")
+                        parsed = json.loads(content_str)
+                        seen_map = parsed.get("seen", {}) if isinstance(parsed, dict) else {}
+                        cutoff = datetime.now(timezone.utc).timestamp() - (28 * 3600)
+                        valid = {k: float(v) for k, v in seen_map.items() if float(v) >= cutoff}
+                        logger.info(f"☁️ Restored {len(valid)} seen messages from GitHub Gist ({self.gist_id[:8]}...).")
+                        return valid
+                else:
+                    logger.warning(f"Gist load status {res.status_code}: {res.text[:100]}")
+        except Exception as e:
+            logger.warning(f"Gist load error: {e}")
+        return {}
+
+    async def save_seen(self, seen_dict: Dict[str, float]) -> bool:
+        """Prune older than 28h and sync to GitHub Gist."""
+        if not self.enabled:
+            return False
+        try:
+            cutoff = datetime.now(timezone.utc).timestamp() - (28 * 3600)
+            cleaned = {k: v for k, v in seen_dict.items() if v >= cutoff}
+            payload = {
+                "description": "24/7 OTPMAN Bot Persistent Storage (28h retention)",
+                "files": {
+                    self.filename: {
+                        "content": json.dumps({
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "bot": "OTPMAN",
+                            "count": len(cleaned),
+                            "seen": cleaned
+                        }, indent=2)
+                    }
+                }
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.patch(
+                    self.api_url,
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    json=payload
+                )
+                if res.is_success:
+                    logger.info(f"☁️ Synced {len(cleaned)} messages to GitHub Gist.")
+                    return True
+                else:
+                    logger.warning(f"Gist sync status {res.status_code}: {res.text[:100]}")
+        except Exception as e:
+            logger.warning(f"Gist sync error: {e}")
+        return False
+
+gist_storage = GistStorage(GIST_ID, GIST_TOKEN, filename="otpman_seen_messages.json")
 
 def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
@@ -237,9 +322,14 @@ def is_message_seen(message_id: str) -> bool:
 
 def save_processed_message(item: Dict[str, Any], chat_id: int,
                            country: str = "", masked_num: str = "", otp_code: str = "") -> bool:
+    global _gist_dirty
     mid = generate_message_key(item)
     if not mid:
         return False
+    seen_message_ids.add(mid)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    seen_timestamps[mid] = now_ts
+    _gist_dirty = True
     source       = str(item.get("source") or item.get("sender") or item.get("caller") or "")
     rate         = str(item.get("rate") or "")
     raw_message  = str(item.get("message") or item.get("text") or item.get("body") or "")
@@ -252,9 +342,7 @@ def save_processed_message(item: Dict[str, Any], chat_id: int,
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (mid, source, country, masked_num, otp_code, raw_message, rate, message_time, chat_id))
             conn.commit()
-            if cur.rowcount > 0:
-                seen_message_ids.add(mid)
-                return True
+            return True
     except Exception as e:
         logger.error(f"DB save error: {e}")
     return False
@@ -792,21 +880,32 @@ async def _deliver_item(bot: Bot, item: Dict[str, Any], dest_ids: Set[int]) -> b
     return sent_to_any
 
 async def poll_incoming_messages(application: Application):
-    global total_forwarded_count
+    global total_forwarded_count, _gist_dirty
     init_db()
     bot_start_time = datetime.now(timezone.utc).timestamp()
     logger.info(f"🚀 OTPMAN polling engine started at epoch {bot_start_time:.0f}.")
 
-    # Preload known IDs from DB
+    # 1. Preload 28h history from GitHub Gist cloud storage
+    if gist_storage.enabled:
+        gist_seen = await gist_storage.load_seen()
+        for k, ts in gist_seen.items():
+            seen_message_ids.add(k)
+            seen_timestamps[k] = ts
+        logger.info(f"☁️ Restored {len(gist_seen)} persistent message IDs from GitHub Gist.")
+
+    # 2. Preload known IDs from local DB
     try:
         with get_db_connection() as conn:
             for row in conn.execute("SELECT id FROM processed_otps ORDER BY forwarded_at DESC LIMIT 10000;"):
-                seen_message_ids.add(str(row["id"]))
-        logger.info(f"Preloaded {len(seen_message_ids)} seen message keys.")
+                mid = str(row["id"])
+                seen_message_ids.add(mid)
+                if mid not in seen_timestamps:
+                    seen_timestamps[mid] = bot_start_time
+        logger.info(f"Preloaded {len(seen_message_ids)} total seen message keys.")
     except Exception as e:
         logger.warning(f"Preload error: {e}")
 
-    # Startup pass: baseline history, mark ALL existing messages as seen (NEVER forward old history)
+    # 3. Startup pass: baseline history, mark ALL existing messages as seen (NEVER forward old history)
     try:
         initial_msgs = await client.fetch_incoming_messages()
         baselined    = 0
@@ -815,6 +914,7 @@ async def poll_incoming_messages(application: Application):
             if not mid:
                 continue
             seen_message_ids.add(mid)
+            seen_timestamps[mid] = bot_start_time
             raw_num = str(item.get("number") or item.get("destinationNumber") or "")
             num     = mask_phone_number(raw_num)
             raw_msg = str(item.get("message") or item.get("text") or item.get("body") or "")
@@ -823,6 +923,8 @@ async def poll_incoming_messages(application: Application):
             iso     = get_country_iso_display(item)
             save_processed_message(item, gid or 0, iso, num, otp)
             baselined += 1
+        if baselined > 0 and gist_storage.enabled:
+            await gist_storage.save_seen(seen_timestamps)
         logger.info(f"✅ Startup: {baselined} historical messages baselined (0 old messages forwarded).")
     except Exception as e:
         logger.warning(f"Startup pass error: {e}")
@@ -842,9 +944,12 @@ async def poll_incoming_messages(application: Application):
                     msg_ts = parse_message_timestamp(str(m.get("received_at") or m.get("createdAt") or m.get("messageTime") or ""))
                     if msg_ts > 0 and msg_ts < (bot_start_time - 15.0):
                         seen_message_ids.add(k)
+                        seen_timestamps[k] = msg_ts
                         continue
                     new_items.append(m)
                     seen_message_ids.add(k)  # Mark seen immediately
+                    seen_timestamps[k] = datetime.now(timezone.utc).timestamp()
+                    _gist_dirty = True
 
                 if new_items:
                     logger.info(f"🔔 {len(new_items)} new SMS/OTP(s) detected from OTPMAN!")
@@ -889,10 +994,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             country_lines += f"  {idx}. {iso_display} — <code>{cnt}</code>\n"
         country_lines += "━━━━━━━━━━━━━━━━━━━━\n"
 
+    gist_status = f"Connected ({GIST_ID[:8]}...) ☁️" if gist_storage.enabled else "Local Storage"
     msg = (
         f"👑 <b>OTPMAN (Admin Panel)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Platform:</b> <code>Augestel ({OTPMAN_BASE_URL})</code>\n"
         f"• <b>Status:</b> <code>Active & Running ✅</code>\n"
+        f"• <b>Storage:</b> <code>{gist_status}</code>\n"
         f"• <b>Target Groups:</b> <code>{group_text}</code>\n"
         f"• <b>OTPs Forwarded:</b> <code>{total_forwarded_count} (this session)</code>\n"
         f"• <b>Database:</b> <code>{db_count} total OTPs stored</code>\n"
@@ -959,6 +1067,14 @@ async def periodic_db_cleanup_loop():
         cleanup_old_messages(max_age_days=7)
         logger.info("🧹 Old OTP records cleaned up (>7 days).")
 
+async def periodic_gist_sync_loop():
+    global _gist_dirty
+    while True:
+        await asyncio.sleep(30.0)
+        if _gist_dirty and gist_storage.enabled:
+            _gist_dirty = False
+            await gist_storage.save_seen(seen_timestamps)
+
 # ==========================================
 # 11. Diagnostics (--test mode)
 # ==========================================
@@ -968,7 +1084,7 @@ async def run_diagnostics():
     print("=======================================================")
 
     # 1. Telegram bot
-    print("[1/4] Checking Telegram Bot Token...")
+    print("[1/5] Checking Telegram Bot Token...")
     try:
         req = HTTPXRequest(connection_pool_size=4)
         bot = Bot(token=TELEGRAM_BOT_TOKEN, request=req)
@@ -979,7 +1095,7 @@ async def run_diagnostics():
         return
 
     # 2. Linked groups (Primary + Secondary)
-    print("\n[2/4] Checking Linked Groups...")
+    print("\n[2/5] Checking Linked Groups...")
     group_ids = get_target_group_chat_ids()
     if group_ids:
         for idx, gid in enumerate(group_ids, 1):
@@ -993,21 +1109,29 @@ async def run_diagnostics():
         print("  -> WARNING: No group chat IDs configured.")
 
     # 3. OTPMAN API
-    print("\n[3/4] Checking OTPMAN API Connection...")
+    print("\n[3/5] Checking OTPMAN API Connection...")
     init_db()
     try:
         msgs = await client.fetch_incoming_messages()
         print(f"  -> SUCCESS! Connected to {OTPMAN_BASE_URL}")
         print(f"  -> Total recent live messages fetched: {len(msgs)}")
-        if msgs:
-            m = msgs[0]
-            print(f"  -> Latest SMS Sample: Key {m.get('_key', '')[:12]}... | Sender: {m.get('source')} | Number: {m.get('number')}")
-            print(f"  -> Message Preview: \"{str(m.get('message',''))[:80]}\"")
     except Exception as e:
         print(f"  -> FAILED: {e}")
 
-    # 4. SQLite DB
-    print("\n[4/4] Checking Local SQLite Database...")
+    # 4. GitHub Gist
+    print("\n[4/5] Checking GitHub Gist Cloud Storage (28h Retention)...")
+    if gist_storage.enabled:
+        try:
+            data = await gist_storage.load_seen()
+            print(f"  -> SUCCESS! Connected to GitHub Gist: '{GIST_ID}'")
+            print(f"  -> Stored 28h seen message count: {len(data)}")
+        except Exception as e:
+            print(f"  -> WARNING: Gist check failed ({e})")
+    else:
+        print("  -> INFO: GitHub Gist storage not configured (using local SQLite database).")
+
+    # 5. SQLite DB
+    print("\n[5/5] Checking Local SQLite Database...")
     try:
         count = get_total_processed_count()
         print(f"  -> SUCCESS! Database connected: '{DB_FILE}'")
@@ -1060,7 +1184,7 @@ async def main():
     )
     application.add_handler(CommandHandler("start", start_command))
 
-    async with application:
+    try:
         await application.initialize()
         await application.start()
         # Explicitly dispatch startup announcement
@@ -1085,7 +1209,6 @@ async def main():
                 logger.warning(f"Telegram polling warning on attempt {attempt}: {poll_err}")
                 await asyncio.sleep(3.0)
 
-        # Infinite resilient keepalive loop
         while True:
             try:
                 await asyncio.sleep(3600)
@@ -1094,6 +1217,9 @@ async def main():
             except Exception as e:
                 logger.error(f"Keepalive loop warning: {e}")
                 await asyncio.sleep(5)
+    finally:
+        if _gist_dirty and gist_storage.enabled:
+            await gist_storage.save_seen(seen_timestamps)
 
 if __name__ == "__main__":
     try:
