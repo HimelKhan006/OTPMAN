@@ -303,7 +303,6 @@ class OTPManClient:
         self.timeout   = timeout
         self._client: Optional[httpx.AsyncClient] = None
         self.last_request_ts: float = 0.0
-        self.min_interval: float = float(os.getenv("POLL_INTERVAL_SECONDS", "12.0"))
 
     def _get_http_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -319,12 +318,6 @@ class OTPManClient:
         return self._client
 
     async def fetch_incoming_messages(self) -> List[Dict[str, Any]]:
-        # Enforce rate limit gap (minimum 12.0s between requests)
-        elapsed = asyncio.get_event_loop().time() - self.last_request_ts
-        if self.last_request_ts > 0 and elapsed < self.min_interval:
-            wait_gap = self.min_interval - elapsed
-            await asyncio.sleep(wait_gap)
-
         try:
             client = self._get_http_client()
             start_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -340,28 +333,17 @@ class OTPManClient:
             self.last_request_ts = asyncio.get_event_loop().time()
             res = await client.get(url, params=params)
 
-            # Parse official rate limit headers
-            limit_val     = res.headers.get("X-RateLimit-Limit")
-            remaining_val = res.headers.get("X-RateLimit-Remaining")
-            reset_ts_val  = res.headers.get("X-RateLimit-Reset")
-
+            # If server explicitly returns 429, wait only the requested seconds
             if res.status_code == 429:
                 retry_hdr = res.headers.get("Retry-After")
                 try:
                     data = res.json()
-                    wait_sec = float(retry_hdr or data.get("error", {}).get("retry_after") or 12.0)
+                    wait_sec = float(retry_hdr or data.get("error", {}).get("retry_after") or 5.0)
                 except Exception:
-                    wait_sec = float(retry_hdr or 12.0)
-                logger.warning(f"⚠️ OTPMAN Rate Limited (429). Waiting {wait_sec:.0f}s cooldown...")
-                await asyncio.sleep(wait_sec + 0.5)
+                    wait_sec = float(retry_hdr or 5.0)
+                logger.warning(f"⚠️ OTPMAN Rate Limited (429). Server requested {wait_sec:.0f}s wait...")
+                await asyncio.sleep(wait_sec)
                 return []
-
-            if remaining_val is not None and str(remaining_val).isdigit() and int(remaining_val) == 0:
-                if reset_ts_val and str(reset_ts_val).isdigit():
-                    now_epoch = datetime.now(timezone.utc).timestamp()
-                    sleep_until_reset = max(float(reset_ts_val) - now_epoch + 0.5, 1.0)
-                    logger.info(f"⏳ Rate limit quota waiting {sleep_until_reset:.1f}s for reset window...")
-                    await asyncio.sleep(sleep_until_reset)
 
             if res.is_success:
                 data = res.json()
@@ -802,15 +784,10 @@ async def _deliver_item(bot: Bot, item: Dict[str, Any], dest_ids: Set[int]) -> b
     return sent_to_any
 
 async def poll_incoming_messages(application: Application):
-    """
-    Crash-proof background polling loop for OTPMAN.
-    - Runs forever without restarting the process
-    - Baselines history on startup (marks all existing as seen)
-    - Delivers live incoming OTPs to all configured Telegram Groups
-    """
     global total_forwarded_count
     init_db()
-    logger.info("🚀 OTPMAN polling engine started (crash-proof, dual-group delivery).")
+    bot_start_time = datetime.now(timezone.utc).timestamp()
+    logger.info(f"🚀 OTPMAN polling engine started at epoch {bot_start_time:.0f}.")
 
     # Preload known IDs from DB
     try:
@@ -851,9 +828,15 @@ async def poll_incoming_messages(application: Application):
                 new_items = []
                 for m in messages:
                     k = generate_message_key(m)
-                    if k and not is_message_seen(k):
-                        new_items.append(m)
-                        seen_message_ids.add(k)  # Mark seen immediately
+                    if not k or is_message_seen(k):
+                        continue
+                    # Timestamp check: ignore any SMS older than bot startup time
+                    msg_ts = parse_message_timestamp(str(m.get("received_at") or m.get("createdAt") or m.get("messageTime") or ""))
+                    if msg_ts > 0 and msg_ts < (bot_start_time - 15.0):
+                        seen_message_ids.add(k)
+                        continue
+                    new_items.append(m)
+                    seen_message_ids.add(k)  # Mark seen immediately
 
                 if new_items:
                     logger.info(f"🔔 {len(new_items)} new SMS/OTP(s) detected from OTPMAN!")
