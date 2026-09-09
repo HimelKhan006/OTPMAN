@@ -196,6 +196,9 @@ GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOK
 seen_message_ids: Set[str] = set()
 seen_timestamps: Dict[str, float] = {}
 _gist_dirty: bool = False
+_is_handover: bool = os.getenv("IS_HANDOVER", "false").strip().lower() in ("true", "1", "yes")
+_handover_epoch: float = 0.0
+bot_process_start_time: float = time.time()
 
 GIST_HEADERS = {
     "Accept": "application/vnd.github+json",
@@ -233,13 +236,11 @@ class GistStorage:
                             matching_gists.append(g)
 
                     if matching_gists:
-                        # Use the first matching Gist
                         primary = matching_gists[0]
                         self.gist_id = primary.get("id", "")
                         self.api_url = f"https://api.github.com/gists/{self.gist_id}"
                         logger.info(f"☁️ Reusing existing GitHub Gist: {self.gist_id}")
 
-                        # Automatically DELETE any duplicate Gists from previous runs
                         for dup in matching_gists[1:]:
                             dup_id = dup.get("id")
                             if dup_id and dup_id != self.gist_id:
@@ -260,7 +261,7 @@ class GistStorage:
                         "public": False,
                         "files": {
                             self.filename: {
-                                "content": json.dumps({"seen": {}, "bot": self.bot_name, "count": 0}, indent=2)
+                                "content": json.dumps({"seen": {}, "bot": self.bot_name, "count": 0, "handover": False}, indent=2)
                             }
                         }
                     }
@@ -276,8 +277,8 @@ class GistStorage:
             logger.warning(f"Gist auto-management error: {e}")
         return False
 
-    async def load_seen(self) -> Dict[str, float]:
-        """Fetch 28h history from GitHub Gist."""
+    async def load_state(self) -> Dict[str, Any]:
+        """Fetch 28h history and continuous handover state from GitHub Gist."""
         if not self.enabled or not self.api_url:
             return {}
         try:
@@ -289,47 +290,71 @@ class GistStorage:
                     if self.filename in files:
                         content_str = files[self.filename].get("content", "{}")
                         parsed = json.loads(content_str)
-                        seen_map = parsed.get("seen", {}) if isinstance(parsed, dict) else {}
-                        cutoff = datetime.now(timezone.utc).timestamp() - (28 * 3600)
-                        valid = {k: float(v) for k, v in seen_map.items() if float(v) >= cutoff}
-                        logger.info(f"☁️ Restored {len(valid)} seen messages from GitHub Gist ({self.gist_id[:8]}...).")
-                        return valid
+                        if isinstance(parsed, dict):
+                            seen_map = parsed.get("seen", {})
+                            cutoff = datetime.now(timezone.utc).timestamp() - (28 * 3600)
+                            valid_seen = {k: float(v) for k, v in seen_map.items() if float(v) >= cutoff}
+                            logger.info(f"☁️ Restored {len(valid_seen)} seen messages from GitHub Gist ({self.gist_id[:8]}...).")
+                            return {
+                                "seen": valid_seen,
+                                "handover": bool(parsed.get("handover", False)),
+                                "handover_epoch": float(parsed.get("handover_epoch", 0.0)),
+                                "total_forwarded": int(parsed.get("total_forwarded", 0)),
+                                "country_counts": parsed.get("country_counts", {}),
+                            }
                 else:
                     logger.warning(f"Gist load status {res.status_code}: {res.text[:100]}")
         except Exception as e:
             logger.warning(f"Gist load error: {e}")
         return {}
 
-    async def save_seen(self, seen_dict: Dict[str, float]) -> bool:
-        """Prune older than 28h and sync to GitHub Gist."""
+    async def load_seen(self) -> Dict[str, float]:
+        """Backwards compatibility wrapper for load_state."""
+        state = await self.load_state()
+        return state.get("seen", {})
+
+    async def save_state(self, seen_dict: Dict[str, float], is_handover: bool = False,
+                         total_forwarded: int = 0, country_counts: Optional[Dict[str, int]] = None) -> bool:
+        """Prune older than 28h and sync state & handover markers to GitHub Gist."""
         if not self.enabled or not self.api_url:
             return False
         try:
             cutoff = datetime.now(timezone.utc).timestamp() - (28 * 3600)
             cleaned = {k: v for k, v in seen_dict.items() if v >= cutoff}
+            payload_data = {
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "bot": self.bot_name,
+                "count": len(cleaned),
+                "seen": cleaned,
+                "handover": is_handover,
+                "handover_epoch": datetime.now(timezone.utc).timestamp() if is_handover else 0.0,
+                "total_forwarded": total_forwarded,
+                "country_counts": country_counts or {},
+            }
             payload = {
                 "description": self.description,
                 "files": {
                     self.filename: {
-                        "content": json.dumps({
-                            "updated_at": datetime.now(timezone.utc).isoformat(),
-                            "bot": "OTPMAN",
-                            "count": len(cleaned),
-                            "seen": cleaned
-                        }, indent=2)
+                        "content": json.dumps(payload_data, indent=2)
                     }
                 }
             }
             async with httpx.AsyncClient(timeout=15.0) as http:
                 res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
                 if res.is_success:
-                    logger.info(f"☁️ Synced {len(cleaned)} messages to GitHub Gist.")
+                    logger.info(f"☁️ Synced {len(cleaned)} messages to GitHub Gist (handover={is_handover}).")
                     return True
                 else:
                     logger.warning(f"Gist sync status {res.status_code}: {res.text[:100]}")
         except Exception as e:
             logger.warning(f"Gist sync error: {e}")
         return False
+
+    async def save_seen(self, seen_dict: Dict[str, float]) -> bool:
+        """Backwards compatibility wrapper for save_state."""
+        global total_forwarded_count, country_forwarded_counts
+        return await self.save_state(seen_dict, is_handover=False, total_forwarded=total_forwarded_count,
+                                     country_counts=country_forwarded_counts)
 
 gist_storage = GistStorage(
     GIST_ID, GIST_TOKEN,
@@ -941,18 +966,36 @@ async def _deliver_item(bot: Bot, item: Dict[str, Any], dest_ids: Set[int]) -> b
     return sent_to_any
 
 async def poll_incoming_messages(application: Application):
-    global total_forwarded_count, _gist_dirty
+    global total_forwarded_count, _gist_dirty, _is_handover, _handover_epoch
     init_db()
     bot_start_time = datetime.now(timezone.utc).timestamp()
     logger.info(f"🚀 OTPMAN polling engine started at epoch {bot_start_time:.0f}.")
 
-    # 1. Ensure Gist exists (auto-creates if GIST_ID not set)
+    # 1. Ensure Gist exists and restore state
     if gist_storage.enabled:
         await gist_storage.ensure_gist()
-        gist_seen = await gist_storage.load_seen()
+        gist_state = await gist_storage.load_state()
+        gist_seen = gist_state.get("seen", {})
         for k, ts in gist_seen.items():
             seen_message_ids.add(k)
             seen_timestamps[k] = ts
+
+        # Check if previous session performed a clean zero-restart handover
+        if gist_state.get("handover"):
+            _is_handover = True
+            _handover_epoch = float(gist_state.get("handover_epoch") or 0.0)
+            saved_total = int(gist_state.get("total_forwarded") or 0)
+            if saved_total > total_forwarded_count:
+                total_forwarded_count = saved_total
+            saved_countries = gist_state.get("country_counts", {})
+            if isinstance(saved_countries, dict):
+                for c_iso, c_cnt in saved_countries.items():
+                    country_forwarded_counts[c_iso] = max(country_forwarded_counts.get(c_iso, 0), int(c_cnt))
+            logger.info(
+                f"🔄 Zero-Restart Handover Active: {len(gist_seen)} messages restored, "
+                f"{total_forwarded_count} forwarded previously, last epoch {_handover_epoch:.0f}."
+            )
+
         # Populate local SQLite DB from cloud memory so database is never empty on restarts
         try:
             with get_db_connection() as conn:
@@ -975,14 +1018,36 @@ async def poll_incoming_messages(application: Application):
     except Exception as e:
         logger.warning(f"Preload error: {e}")
 
-    # 3. Startup pass: baseline history, mark ALL existing messages as seen (NEVER forward old history)
+    # 3. Startup pass: baseline history or catch handover transition gap OTPs
     try:
         initial_msgs = await client.fetch_incoming_messages()
-        baselined    = 0
-        for item in initial_msgs:
+        dest_ids = _get_otp_dest_ids()
+        baselined = 0
+        forwarded_handover_gap = 0
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        for item in reversed(initial_msgs):
             mid = generate_message_key(item)
             if not mid:
                 continue
+            if is_message_seen(mid):
+                continue
+
+            # In handover mode: deliver any OTPs that arrived during runner transition gap
+            if _is_handover and _handover_epoch > 0:
+                msg_ts = parse_message_timestamp(str(item.get("received_at") or item.get("createdAt") or item.get("messageTime") or ""))
+                if ((msg_ts > 0 and msg_ts >= (_handover_epoch - 60.0)) or (now_ts - msg_ts < 300.0 and msg_ts > 0)):
+                    if dest_ids:
+                        ok = await _deliver_item(application.bot, item, dest_ids)
+                        if ok:
+                            total_forwarded_count += 1
+                            forwarded_handover_gap += 1
+                            seen_message_ids.add(mid)
+                            seen_timestamps[mid] = now_ts
+                            _gist_dirty = True
+                            continue
+
+            # Otherwise, baseline historical message without forwarding
             seen_message_ids.add(mid)
             seen_timestamps[mid] = bot_start_time
             raw_num = str(item.get("number") or item.get("destinationNumber") or "")
@@ -993,9 +1058,17 @@ async def poll_incoming_messages(application: Application):
             iso     = get_country_iso_display(item)
             save_processed_message(item, gid or 0, iso, num, otp)
             baselined += 1
+
+        if forwarded_handover_gap > 0:
+            logger.info(f"⚡ Zero-Downtime Handover: Delivered {forwarded_handover_gap} OTP(s) received during runner switch gap!")
         if baselined > 0 and gist_storage.enabled:
-            await gist_storage.save_seen(seen_timestamps)
-        logger.info(f"✅ Startup: {baselined} historical messages baselined (0 old messages forwarded).")
+            await gist_storage.save_state(
+                seen_dict=seen_timestamps,
+                is_handover=False,
+                total_forwarded=total_forwarded_count,
+                country_counts=country_forwarded_counts
+            )
+        logger.info(f"✅ Startup pass complete: {baselined} historical messages baselined (0 old messages forwarded).")
     except Exception as e:
         logger.warning(f"Startup pass error: {e}")
 
@@ -1055,54 +1128,84 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_count  = get_total_processed_count()
     group_text = f"{len(group_ids)} Linked Groups ✅" if len(group_ids) > 1 else ("Linked ✅" if group_ids else "Not Linked ⚠️")
 
+    # Uptime calculation
+    uptime_secs = int(time.time() - bot_process_start_time)
+    hours, rem = divmod(uptime_secs, 3600)
+    mins, secs = divmod(rem, 60)
+    uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
+
+    # Handover countdown
+    session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
+    if session_timeout > 0:
+        handover_secs = max(0, session_timeout - uptime_secs)
+        h_hours, h_rem = divmod(handover_secs, 3600)
+        h_mins, _ = divmod(h_rem, 60)
+        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
+    else:
+        handover_info = "<code>Always-Online (Continuous)</code>"
+
     # Build per-country breakdown (sorted by count desc)
     country_lines = ""
     if country_forwarded_counts:
         sorted_countries = sorted(country_forwarded_counts.items(), key=lambda x: x[1], reverse=True)
-        country_lines = "\n🌍 <b>OTPs by Country (this session):</b>\n"
+        country_lines = "\n🌍 <b>OTPs by Country (Cumulative):</b>\n"
         for idx, (iso_display, cnt) in enumerate(sorted_countries[:15], 1):
             country_lines += f"  {idx}. {iso_display} — <code>{cnt}</code>\n"
         country_lines += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    gist_status = f"Connected ({GIST_ID[:8]}...) ☁️" if gist_storage.enabled else "Local Storage"
+    gist_status = f"28h Persistent Memory ({GIST_ID[:8]}...) ☁️" if gist_storage.enabled else "Local Storage"
     msg = (
-        f"👑 <b>OTPMAN (Admin Panel)</b>\n"
+        f"⚡ <b>OTPMAN 24/7 (Zero-Restart Engine)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Engine Status:</b> <code>100% Online & Forwarding ✅</code>\n"
+        f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
+        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
+        f"• <b>Next Handover:</b> {handover_info}\n"
         f"• <b>Platform:</b> <code>Augestel</code>\n"
-        f"• <b>Status:</b> <code>Active & Running ✅</code>\n"
         f"• <b>Storage:</b> <code>{gist_status}</code>\n"
         f"• <b>Target Groups:</b> <code>{group_text}</code>\n"
-        f"• <b>OTPs Forwarded:</b> <code>{total_forwarded_count} (this session)</code>\n"
+        f"• <b>OTPs Forwarded:</b> <code>{total_forwarded_count}</code> <i>(accumulated)</i>\n"
         f"• <b>Database:</b> <code>{db_count} total OTPs stored</code>\n"
         f"• <b>Poll Interval:</b> <code>{POLL_INTERVAL_SECONDS}s</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{country_lines}"
-        f"🔔 Real-time dual-group monitoring active."
+        f"🔔 <i>Real-time seamless forwarding active. Zero restart alerts.</i>"
     )
     await msg_obj.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def send_startup_announcement(application: Application):
     """
-    Sends restart notification to Admin private DM only on every restart.
-    NEVER sends any message to Telegram groups.
+    Sends restart notification to Admin private DM only on initial push or manual test.
+    COMPLETELY SILENT during automated 24/7 handover sessions (zero restart messages).
     """
+    global _is_handover
+    silent_env = os.getenv("SILENT_STARTUP", "").strip().lower() in ("true", "1", "yes")
+    if _is_handover or silent_env:
+        logger.info("🤫 Automated session handover continuation: restart notification suppressed (zero-restart mode).")
+        return
+
+    admin_alert_enabled = os.getenv("ADMIN_STARTUP_ALERT", "false").strip().lower() in ("true", "1", "yes")
+    if not admin_alert_enabled and STARTUP_TYPE != "push":
+        logger.info("ℹ️ OTPMAN started in silent 24/7 background mode (no admin spam).")
+        return
+
     admin_msg = (
-        "🔄 <b>OTPMAN RESTARTED (Admin Alert)</b>\n"
+        "⚡ <b>OTPMAN 24/7 ONLINE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• <b>Status:</b> <code>Active & Monitoring Live OTPs ✅</code>\n"
-        "• <b>Cycle:</b> <code>24-Hour Scheduled Cycle Active ⏱️</code>\n"
+        "• <b>Engine:</b> <code>Zero-Restart Handover Engine 🔄</code>\n"
         "• <b>Platform:</b> <code>Augestel</code>\n"
         "• <b>Storage:</b> <code>28h Memory Active ☁️</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👑 <i>Restart notification dispatched to Admin private DM only.</i>"
+        "👑 <i>Send /start or /status anytime to view live status.</i>"
     )
     for aid in ADMIN_USER_IDS:
         if aid:
             try:
                 await send_with_retry(application.bot, aid, admin_msg)
-                logger.info(f"✅ Restart alert sent to admin private chat {aid}")
+                logger.info(f"✅ Initial alert sent to admin private chat {aid}")
             except Exception as e:
-                logger.warning(f"Restart alert failed for admin {aid}: {e}")
+                logger.warning(f"Initial alert failed for admin {aid}: {e}")
 
 async def periodic_db_cleanup_loop():
     while True:
@@ -1116,7 +1219,12 @@ async def periodic_gist_sync_loop():
         await asyncio.sleep(30.0)
         if _gist_dirty and gist_storage.enabled:
             _gist_dirty = False
-            await gist_storage.save_seen(seen_timestamps)
+            await gist_storage.save_state(
+                seen_dict=seen_timestamps,
+                is_handover=False,
+                total_forwarded=total_forwarded_count,
+                country_counts=country_forwarded_counts
+            )
 
 # ==========================================
 # 11. Diagnostics (--test mode)
@@ -1228,6 +1336,7 @@ async def main():
         .build()
     )
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", start_command))
 
     def start_health_server():
         port_str = os.getenv("PORT")
@@ -1260,12 +1369,16 @@ async def main():
     try:
         await application.initialize()
         await application.start()
-        # Explicitly dispatch startup announcement
+        # Explicitly dispatch startup announcement (silent on handover)
         asyncio.create_task(send_startup_announcement(application))
         asyncio.create_task(poll_incoming_messages(application))
         asyncio.create_task(periodic_db_cleanup_loop())
+        asyncio.create_task(periodic_gist_sync_loop())
         try:
-            await application.bot.set_my_commands([("start", "📊 Bot status & admin panel")])
+            await application.bot.set_my_commands([
+                ("start",  "📊 Bot status & admin dashboard"),
+                ("status", "⚡ Live zero-restart engine status"),
+            ])
         except Exception:
             pass
         logger.info("✅ OTPMAN is fully online and monitoring incoming messages...")
@@ -1282,18 +1395,35 @@ async def main():
                 logger.warning(f"Telegram polling warning on attempt {attempt}: {poll_err}")
                 await asyncio.sleep(3.0)
 
-        # Resilient keepalive loop with optional scheduled session handover
+        # Resilient keepalive loop with scheduled zero-restart session handover
         start_time = time.time()
         session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
         if session_timeout > 0:
-            logger.info(f"⏱️ Session handover timer armed: {session_timeout}s ({session_timeout/3600:.2f}h)")
+            logger.info(f"⏱️ Zero-restart handover timer armed: {session_timeout}s ({session_timeout/3600:.2f}h)")
 
         while True:
             try:
-                if session_timeout > 0 and (time.time() - start_time) >= session_timeout:
-                    logger.info(f"⏱️ Session timeout reached ({session_timeout}s). Initiating clean shutdown for handover...")
+                now = time.time()
+                elapsed = now - start_time
+                if session_timeout > 0 and elapsed >= (session_timeout - 60):
+                    logger.info(f"⏱️ Session limit approaching ({elapsed:.0f}s elapsed of {session_timeout}s).")
+                    logger.info("🔄 Pre-timeout analysis: saving workflow state to Gist & SQLite for seamless handover...")
+                    try:
+                        with get_db_connection() as conn:
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except Exception as e:
+                        logger.warning(f"DB checkpoint notice: {e}")
+
+                    if gist_storage.enabled:
+                        await gist_storage.save_state(
+                            seen_dict=seen_timestamps,
+                            is_handover=True,
+                            total_forwarded=total_forwarded_count,
+                            country_counts=country_forwarded_counts
+                        )
+                    logger.info("✅ Pre-handover state saved. Exiting cleanly for next runner switch (exit 0)...")
                     break
-                sleep_chunk = min(30, session_timeout) if session_timeout > 0 else 3600
+                sleep_chunk = min(15, session_timeout) if session_timeout > 0 else 3600
                 await asyncio.sleep(sleep_chunk)
             except asyncio.CancelledError:
                 break
@@ -1309,8 +1439,19 @@ async def main():
             await application.shutdown()
         except Exception:
             pass
-        if _gist_dirty and gist_storage.enabled:
-            await gist_storage.save_seen(seen_timestamps)
+        try:
+            with get_db_connection() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
+        if gist_storage.enabled:
+            near_timeout = session_timeout > 0 and (time.time() - start_time) >= (session_timeout - 120)
+            await gist_storage.save_state(
+                seen_dict=seen_timestamps,
+                is_handover=near_timeout or _is_handover,
+                total_forwarded=total_forwarded_count,
+                country_counts=country_forwarded_counts
+            )
 
 if __name__ == "__main__":
     try:
