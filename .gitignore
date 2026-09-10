@@ -1,1 +1,11 @@
-SETUP_GUIDE.md
+# Secrets — never push to GitHub
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local database (managed by GitHub Actions cache, not git)
+bot2_database.db
+bot_data.json
